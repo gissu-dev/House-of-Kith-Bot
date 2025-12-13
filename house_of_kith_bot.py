@@ -10,16 +10,13 @@ from openai import OpenAI
 # ========== OPENAI CLIENT ==========
 
 # Put your real OpenAI key here
-client = OpenAI(
-    api_key="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"
-)
+client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 
 # ========== CONFIG ==========
 
 # Put your real Discord bot token here
-DISCORD_TOKEN_FALLBACK = "MTQ0NzYxMTA5NDY5NTY3ODA4Ng.GG-4id.2UJmGaKvW_5qX7zc8Oa5ul-AIxmdqAi5yEaUpY"
-TOKEN = os.getenv("DISCORD_TOKEN", DISCORD_TOKEN_FALLBACK)
+TOKEN = os.environ["DISCORD_TOKEN"]
 
 # Your real IDs (keep as-is unless your server/channel changed)
 GUILD_ID = 1396177343617171598           # your server ID
