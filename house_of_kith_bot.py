@@ -145,6 +145,8 @@ class RoleView(discord.ui.View):
 
 class HouseBot(commands.Bot):
     async def setup_hook(self):
+        # Load tarot readings
+        await self.load_extension("cogs.tarot")
         # Load ghost game (slash + message-driven)
         await self.load_extension("cogs.ghost_game")
 
