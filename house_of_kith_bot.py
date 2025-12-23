@@ -149,6 +149,13 @@ class HouseBot(commands.Bot):
         await self.load_extension("cogs.tarot")
         # Load ghost game (slash + message-driven)
         await self.load_extension("cogs.ghost_game")
+        # Load Megamind ASCII scene player
+        await self.load_extension("cogs.megamind")
+        # Load Valorant stats/party tracker only if API key is present
+        if os.getenv("VAL_API_KEY"):
+            await self.load_extension("cogs.valorant")
+        else:
+            print("Skipping Valorant cog: VAL_API_KEY not set.")
 
         # Persistent role views
         self.add_view(RoleView(SOCIAL_ROLES))

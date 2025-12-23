@@ -300,6 +300,7 @@ CARD_DECK = MAJOR_ARCANA + [
 # CONFIG
 # =========================
 LOG_CHANNEL_ID = 1450608097449083103
+RATE_LIMIT_CHANNEL_ID = 1396180828358316235
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DAILY_PATH = DATA_DIR / "tarot_daily.json"
@@ -330,11 +331,17 @@ class TarotCog(commands.Cog):
     def today_str(self) -> str:
         return datetime.utcnow().date().isoformat()
 
-    def check_daily(self, user_id: int) -> bool:
-        return self.daily_limits.get(str(user_id)) == self.today_str()
+    def check_daily(self, user_id: int, channel_id: Optional[int]) -> bool:
+        if channel_id != RATE_LIMIT_CHANNEL_ID:
+            return False
+        key = f"{channel_id}:{user_id}"
+        return self.daily_limits.get(key) == self.today_str()
 
-    def mark_daily(self, user_id: int):
-        self.daily_limits[str(user_id)] = self.today_str()
+    def mark_daily(self, user_id: int, channel_id: Optional[int]):
+        if channel_id != RATE_LIMIT_CHANNEL_ID:
+            return
+        key = f"{channel_id}:{user_id}"
+        self.daily_limits[key] = self.today_str()
         self.save_daily_limits()
 
     # -------- card helpers --------
@@ -457,7 +464,7 @@ class TarotCog(commands.Cog):
     def daily_block_embed(self) -> discord.Embed:
         return discord.Embed(
             title="Tarot limit reached",
-            description="One reading per day. Try again tomorrow.",
+            description="One reading per day in this channel. Try again tomorrow.",
             color=discord.Color.red(),
         )
 
@@ -504,10 +511,10 @@ class TarotCog(commands.Cog):
         interaction: discord.Interaction,
         intention: Optional[str] = None,
         private: bool = False,
-        visual: bool = False,
+        visual: bool = True,
         interpret: bool = False,
     ):
-        if self.check_daily(interaction.user.id):
+        if self.check_daily(interaction.user.id, interaction.channel_id):
             await interaction.response.send_message(embed=self.daily_block_embed(), ephemeral=True)
             return
 
@@ -520,7 +527,7 @@ class TarotCog(commands.Cog):
             embed.add_field(name="Reading", value=interpretation, inline=False)
 
         await interaction.followup.send(embed=embed, ephemeral=private)
-        self.mark_daily(interaction.user.id)
+        self.mark_daily(interaction.user.id, interaction.channel_id)
         await self.log_reading(interaction.user, intention, [(card, orientation, meaning)], interpretation, spread=False)
 
     @app_commands.command(name="tarotspread", description="Three-card spread: past, present, future.")
@@ -535,10 +542,10 @@ class TarotCog(commands.Cog):
         interaction: discord.Interaction,
         intention: Optional[str] = None,
         private: bool = False,
-        visual: bool = False,
+        visual: bool = True,
         interpret: bool = False,
     ):
-        if self.check_daily(interaction.user.id):
+        if self.check_daily(interaction.user.id, interaction.channel_id):
             await interaction.response.send_message(embed=self.daily_block_embed(), ephemeral=True)
             return
 
@@ -552,13 +559,13 @@ class TarotCog(commands.Cog):
         embeds.append(self.build_spread_summary_embed(spread_cards, intention, interpretation))
 
         await interaction.followup.send(embeds=embeds, ephemeral=private)
-        self.mark_daily(interaction.user.id)
+        self.mark_daily(interaction.user.id, interaction.channel_id)
         await self.log_reading(interaction.user, intention, spread_cards, interpretation, spread=True)
 
     @commands.command(name="tarot")
     async def tarot_prefix(self, ctx: commands.Context, *, intention: Optional[str] = None):
         """Prefix fallback: !tarot [your question/intent]"""
-        if self.check_daily(ctx.author.id):
+        if self.check_daily(ctx.author.id, ctx.channel.id if ctx.channel else None):
             await ctx.send(embed=self.daily_block_embed())
             return
 
@@ -568,13 +575,13 @@ class TarotCog(commands.Cog):
         if interpretation:
             embed.add_field(name="Reading", value=interpretation, inline=False)
         await ctx.send(embed=embed)
-        self.mark_daily(ctx.author.id)
+        self.mark_daily(ctx.author.id, ctx.channel.id if ctx.channel else None)
         await self.log_reading(ctx.author, intention, [(card, orientation, meaning)], interpretation, spread=False)
 
     @commands.command(name="tarotspread")
     async def tarot_spread_prefix(self, ctx: commands.Context, *, intention: Optional[str] = None):
         """Prefix fallback: !tarotspread [question]"""
-        if self.check_daily(ctx.author.id):
+        if self.check_daily(ctx.author.id, ctx.channel.id if ctx.channel else None):
             await ctx.send(embed=self.daily_block_embed())
             return
 
@@ -586,7 +593,7 @@ class TarotCog(commands.Cog):
         embeds.append(self.build_spread_summary_embed(spread_cards, intention, interpretation))
 
         await ctx.send(embeds=embeds)
-        self.mark_daily(ctx.author.id)
+        self.mark_daily(ctx.author.id, ctx.channel.id if ctx.channel else None)
         await self.log_reading(ctx.author, intention, spread_cards, interpretation, spread=True)
 
 
