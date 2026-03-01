@@ -244,7 +244,6 @@ SUIT_PREFIX = {
     "PENTACLES": "pe",
 }
 RANK_NUMBER = {
-    "Ace": 1,
     "Two": 2,
     "Three": 3,
     "Four": 4,
@@ -254,10 +253,14 @@ RANK_NUMBER = {
     "Eight": 8,
     "Nine": 9,
     "Ten": 10,
-    "Page": 11,
-    "Knight": 12,
-    "Queen": 13,
-    "King": 14,
+}
+
+RANK_SUFFIX = {
+    "Ace": "ac",
+    "Page": "pa",
+    "Knight": "kn",
+    "Queen": "qu",
+    "King": "ki",
 }
 
 MAJOR_IMAGE_MAP = {
@@ -365,8 +368,13 @@ class TarotCog(commands.Cog):
         if len(parts) == 2:
             rank, suit = parts[0], parts[1].strip().upper()
             prefix = SUIT_PREFIX.get(suit)
+            if not prefix:
+                return None
+            suffix = RANK_SUFFIX.get(rank)
+            if suffix:
+                return f"{MINOR_IMAGE_BASE}{prefix}{suffix}.jpg"
             num = RANK_NUMBER.get(rank)
-            if prefix and num:
+            if num:
                 return f"{MINOR_IMAGE_BASE}{prefix}{num:02d}.jpg"
         return None
 
@@ -385,20 +393,125 @@ class TarotCog(commands.Cog):
         bot = "╚" + ("═" * 24) + "╝"
         return "\n".join([top, mid, bot])
 
-    async def interpret(self, intention: Optional[str], cards: List[Tuple[dict, str, str]], spread: bool) -> Optional[str]:
-        if not client:
-            return None
+    def finalize_interpretation_text(self, text: str, limit: int = 1000) -> str:
+        """Keep interpretation under embed limits and avoid mid-sentence cutoffs."""
+        cleaned = " ".join((text or "").strip().split())
+        if not cleaned:
+            return ""
+        if len(cleaned) > limit:
+            cleaned = cleaned[:limit].rstrip()
+        if cleaned.endswith((".", "!", "?")):
+            return cleaned
+        # Try to end on the last full sentence boundary.
+        for sep in (". ", "! ", "? "):
+            idx = cleaned.rfind(sep)
+            if idx >= 120:
+                return cleaned[: idx + 1].strip()
+        # If no boundary found, end safely.
+        if len(cleaned) >= limit:
+            return cleaned.rstrip(" ,;:-") + "..."
+        return cleaned + "."
+
+    def is_yes_no_question(self, focus: Optional[str]) -> bool:
+        if not focus:
+            return False
+        q = focus.strip().lower()
+        if " or " in q:
+            return False
+        starters = (
+            "will ",
+            "should ",
+            "is ",
+            "are ",
+            "do ",
+            "does ",
+            "did ",
+            "can ",
+            "could ",
+            "would ",
+            "am ",
+            "have ",
+            "has ",
+        )
+        return q.endswith("?") or q.startswith(starters)
+
+    def card_signal_score(self, meaning: str, orientation: str) -> float:
+        text = meaning.lower()
+        positive = (
+            "clarity", "hope", "growth", "aligned", "completion", "guidance", "momentum",
+            "strength", "relief", "success", "calm", "warmth", "trust", "balance",
+        )
+        negative = (
+            "stalled", "delay", "fear", "conflict", "misaligned", "avoidance", "doubt",
+            "imbalance", "drained", "stagnation", "overburdened", "reckless", "trap",
+        )
+
+        score = 0.6 if orientation == "upright" else -0.6
+        score += sum(1 for word in positive if word in text) * 0.35
+        score -= sum(1 for word in negative if word in text) * 0.35
+        return score
+
+    def verdict_from_cards(self, cards: List[Tuple[dict, str, str]]) -> str:
+        if not cards:
+            return "Unclear"
+        avg = sum(self.card_signal_score(meaning, orientation) for _, orientation, meaning in cards) / len(cards)
+        if avg >= 0.9:
+            return "Yes"
+        if avg >= 0.2:
+            return "Leaning yes"
+        if avg <= -0.9:
+            return "No"
+        if avg <= -0.2:
+            return "Leaning no"
+        return "Unclear"
+
+    def fallback_interpretation(self, focus: Optional[str], cards: List[Tuple[dict, str, str]], spread: bool) -> str:
+        yes_no = self.is_yes_no_question(focus)
+        verdict = self.verdict_from_cards(cards) if yes_no else ""
+        if spread:
+            labels = ["Past", "Present", "Future"]
+            parts = []
+            for label, (card, orientation, meaning) in zip(labels, cards):
+                parts.append(f"{label}: {card['name']} ({orientation}) suggests {meaning.lower()}")
+            prefix = f"Focus: {focus}. " if focus else ""
+            verdict_line = f"Verdict: {verdict}. " if yes_no else ""
+            return (
+                f"{verdict_line}{prefix}Your spread shows a clear pattern. "
+                + " ".join(parts)
+                + " Take what resonates and leave what does not."
+            )
+        card, orientation, meaning = cards[0]
+        prefix = f"Focus: {focus}. " if focus else ""
+        verdict_line = f"Verdict: {verdict}. " if yes_no else ""
+        return (
+            f"{verdict_line}{prefix}{card['name']} ({orientation}) points to this theme: {meaning} "
+            "Use this as guidance for your next step."
+        )
+
+    async def interpret(self, focus: Optional[str], cards: List[Tuple[dict, str, str]], spread: bool) -> str:
         prompt_cards = [f"{card['name']} ({orientation}): {meaning}" for card, orientation, meaning in cards]
         system = (
-            "You are a concise tarot reader for a soft goth Discord server. "
-            "Offer a brief, grounded interpretation (3-5 sentences), not fortune-telling. "
-            "Stay kind, non-deterministic, and invite reflection."
+            "You are a skilled tarot reader with a calm, mystical voice. "
+            "Sound intuitive and a little magical, but never cheesy or dramatic. "
+            "Give a grounded interpretation in 4-6 sentences. "
+            "Do not claim certainty or fixed future outcomes. "
+            "End with one practical next step and a complete final sentence."
         )
+        yes_no = self.is_yes_no_question(focus)
+        verdict_hint = self.verdict_from_cards(cards) if yes_no else ""
         user = (
-            f"Question: {intention or 'General'}\n"
+            f"Focus: {focus or 'General guidance'}\n"
             f"Spread type: {'Three-card' if spread else 'Single'}\n"
             "Cards:\n- " + "\n- ".join(prompt_cards)
         )
+        if yes_no:
+            user += (
+                "\nThis is a yes/no style question. "
+                f"Start with exactly: `Verdict: {verdict_hint}.` "
+                "Then explain briefly how the cards support that verdict."
+            )
+        if not client:
+            return self.fallback_interpretation(focus, cards, spread)
         try:
             resp = client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -406,12 +519,19 @@ class TarotCog(commands.Cog):
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                max_tokens=180,
+                max_tokens=260,
                 temperature=0.8,
             )
-            return resp.choices[0].message.content.strip()
+            text = self.finalize_interpretation_text(resp.choices[0].message.content or "")
+            if yes_no and not text.lower().startswith("verdict:"):
+                text = f"Verdict: {verdict_hint}. {text}"
+            return text or self.finalize_interpretation_text(
+                self.fallback_interpretation(focus, cards, spread)
+            )
         except Exception:
-            return None
+            return self.finalize_interpretation_text(
+                self.fallback_interpretation(focus, cards, spread)
+            )
 
     # -------- embeds --------
     def build_card_embed(
@@ -419,7 +539,7 @@ class TarotCog(commands.Cog):
         card: dict,
         orientation: str,
         meaning: str,
-        intention: Optional[str],
+        focus: Optional[str],
         visual: bool,
     ) -> discord.Embed:
         embed = discord.Embed(
@@ -428,8 +548,8 @@ class TarotCog(commands.Cog):
             color=discord.Color.from_str("#2a1f2f"),
         )
         embed.add_field(name="Atmosphere", value=card["aesthetic"], inline=False)
-        if intention:
-            embed.add_field(name="Intention", value=intention[:1024], inline=False)
+        if focus:
+            embed.add_field(name="Your Focus", value=focus[:1024], inline=False)
         image_url = self.card_image(card)
         if image_url:
             embed.set_image(url=image_url)
@@ -441,13 +561,13 @@ class TarotCog(commands.Cog):
     def build_spread_summary_embed(
         self,
         cards: List[Tuple[dict, str, str]],
-        intention: Optional[str],
-        interpretation: Optional[str],
+        focus: Optional[str],
+        interpretation: str,
     ) -> discord.Embed:
         labels = ["Past", "Present", "Future"]
         embed = discord.Embed(
             title="Three-Card Spread",
-            description=intention[:1024] if intention else "Past / Present / Future",
+            description=focus[:1024] if focus else "Past / Present / Future",
             color=discord.Color.from_str("#2a1f2f"),
         )
         for label, (card, orientation, meaning) in zip(labels, cards):
@@ -456,15 +576,14 @@ class TarotCog(commands.Cog):
                 value=f"{meaning}\n*{card['aesthetic']}*",
                 inline=False,
             )
-        if interpretation:
-            embed.add_field(name="Reading", value=interpretation, inline=False)
+        embed.add_field(name="Interpretation", value=interpretation, inline=False)
         embed.set_footer(text=random.choice(WHISPERS) + " — Take what resonates; leave what does not.")
         return embed
 
     def daily_block_embed(self) -> discord.Embed:
         return discord.Embed(
-            title="Tarot limit reached",
-            description="One reading per day in this channel. Try again tomorrow.",
+            title="Daily reading already used",
+            description="You already received a tarot reading in this channel today. Try again tomorrow.",
             color=discord.Color.red(),
         )
 
@@ -472,9 +591,9 @@ class TarotCog(commands.Cog):
     async def log_reading(
         self,
         user: discord.abc.User,
-        intention: Optional[str],
+        focus: Optional[str],
         cards: List[Tuple[dict, str, str]],
-        interpretation: Optional[str],
+        interpretation: str,
         spread: bool,
     ):
         channel = self.bot.get_channel(LOG_CHANNEL_ID)
@@ -491,28 +610,25 @@ class TarotCog(commands.Cog):
             timestamp=datetime.utcnow(),
         )
         embed.add_field(name="User", value=f"{user.mention} ({user.id})", inline=False)
-        if intention:
-            embed.add_field(name="Intention", value=intention[:1024], inline=False)
+        if focus:
+            embed.add_field(name="Focus", value=focus[:1024], inline=False)
         embed.add_field(name="Cards", value="\n".join(card_lines), inline=False)
-        if interpretation:
-            embed.add_field(name="Reading", value=interpretation, inline=False)
+        embed.add_field(name="Reading", value=interpretation, inline=False)
         await channel.send(embed=embed)
 
     # -------- commands --------
-    @app_commands.command(name="tarot", description="Draw a single tarot card from the House deck.")
+    @app_commands.command(name="tarot", description="Get a one-card tarot reading with guidance.")
     @app_commands.describe(
-        intention="What are you asking about?",
-        private="Send only to you (ephemeral).",
-        visual="Add ASCII fallback if no image loads.",
-        interpret="Let the AI offer a short reading.",
+        focus="What would you like guidance on? (optional)",
+        private="If enabled, only you can see this reading.",
+        visual="Show ASCII fallback if an image does not load.",
     )
     async def tarot(
         self,
         interaction: discord.Interaction,
-        intention: Optional[str] = None,
+        focus: Optional[str] = None,
         private: bool = False,
         visual: bool = True,
-        interpret: bool = False,
     ):
         if self.check_daily(interaction.user.id, interaction.channel_id):
             await interaction.response.send_message(embed=self.daily_block_embed(), ephemeral=True)
@@ -520,30 +636,27 @@ class TarotCog(commands.Cog):
 
         await interaction.response.defer(ephemeral=private, thinking=True)
         card, orientation, meaning = self.draw_card()
-        interpretation = await self.interpret(intention, [(card, orientation, meaning)], spread=False) if interpret else None
+        interpretation = await self.interpret(focus, [(card, orientation, meaning)], spread=False)
 
-        embed = self.build_card_embed(card, orientation, meaning, intention, visual)
-        if interpretation:
-            embed.add_field(name="Reading", value=interpretation, inline=False)
+        embed = self.build_card_embed(card, orientation, meaning, focus, visual)
+        embed.add_field(name="Interpretation", value=interpretation, inline=False)
 
         await interaction.followup.send(embed=embed, ephemeral=private)
         self.mark_daily(interaction.user.id, interaction.channel_id)
-        await self.log_reading(interaction.user, intention, [(card, orientation, meaning)], interpretation, spread=False)
+        await self.log_reading(interaction.user, focus, [(card, orientation, meaning)], interpretation, spread=False)
 
-    @app_commands.command(name="tarotspread", description="Three-card spread: past, present, future.")
+    @app_commands.command(name="tarotspread", description="Get a 3-card reading: past, present, and next step.")
     @app_commands.describe(
-        intention="Your question or focus for the spread.",
-        private="Send only to you (ephemeral).",
-        visual="Add ASCII fallback if any image fails to load.",
-        interpret="Let the AI offer a short reading.",
+        focus="What would you like this spread to focus on? (optional)",
+        private="If enabled, only you can see this reading.",
+        visual="Show ASCII fallback if an image does not load.",
     )
     async def tarotspread(
         self,
         interaction: discord.Interaction,
-        intention: Optional[str] = None,
+        focus: Optional[str] = None,
         private: bool = False,
         visual: bool = True,
-        interpret: bool = False,
     ):
         if self.check_daily(interaction.user.id, interaction.channel_id):
             await interaction.response.send_message(embed=self.daily_block_embed(), ephemeral=True)
@@ -551,50 +664,49 @@ class TarotCog(commands.Cog):
 
         await interaction.response.defer(ephemeral=private, thinking=True)
         spread_cards = self.draw_spread(3)
-        interpretation = await self.interpret(intention, spread_cards, spread=True) if interpret else None
+        interpretation = await self.interpret(focus, spread_cards, spread=True)
 
         embeds: List[discord.Embed] = []
         for card, orientation, meaning in spread_cards:
             embeds.append(self.build_card_embed(card, orientation, meaning, None, visual))
-        embeds.append(self.build_spread_summary_embed(spread_cards, intention, interpretation))
+        embeds.append(self.build_spread_summary_embed(spread_cards, focus, interpretation))
 
         await interaction.followup.send(embeds=embeds, ephemeral=private)
         self.mark_daily(interaction.user.id, interaction.channel_id)
-        await self.log_reading(interaction.user, intention, spread_cards, interpretation, spread=True)
+        await self.log_reading(interaction.user, focus, spread_cards, interpretation, spread=True)
 
     @commands.command(name="tarot")
-    async def tarot_prefix(self, ctx: commands.Context, *, intention: Optional[str] = None):
-        """Prefix fallback: !tarot [your question/intent]"""
+    async def tarot_prefix(self, ctx: commands.Context, *, focus: Optional[str] = None):
+        """Prefix fallback: !tarot [optional focus/question]"""
         if self.check_daily(ctx.author.id, ctx.channel.id if ctx.channel else None):
             await ctx.send(embed=self.daily_block_embed())
             return
 
         card, orientation, meaning = self.draw_card()
-        interpretation = await self.interpret(intention, [(card, orientation, meaning)], spread=False)
-        embed = self.build_card_embed(card, orientation, meaning, intention, visual=True)
-        if interpretation:
-            embed.add_field(name="Reading", value=interpretation, inline=False)
+        interpretation = await self.interpret(focus, [(card, orientation, meaning)], spread=False)
+        embed = self.build_card_embed(card, orientation, meaning, focus, visual=True)
+        embed.add_field(name="Interpretation", value=interpretation, inline=False)
         await ctx.send(embed=embed)
         self.mark_daily(ctx.author.id, ctx.channel.id if ctx.channel else None)
-        await self.log_reading(ctx.author, intention, [(card, orientation, meaning)], interpretation, spread=False)
+        await self.log_reading(ctx.author, focus, [(card, orientation, meaning)], interpretation, spread=False)
 
     @commands.command(name="tarotspread")
-    async def tarot_spread_prefix(self, ctx: commands.Context, *, intention: Optional[str] = None):
-        """Prefix fallback: !tarotspread [question]"""
+    async def tarot_spread_prefix(self, ctx: commands.Context, *, focus: Optional[str] = None):
+        """Prefix fallback: !tarotspread [optional focus/question]"""
         if self.check_daily(ctx.author.id, ctx.channel.id if ctx.channel else None):
             await ctx.send(embed=self.daily_block_embed())
             return
 
         spread_cards = self.draw_spread(3)
-        interpretation = await self.interpret(intention, spread_cards, spread=True)
+        interpretation = await self.interpret(focus, spread_cards, spread=True)
         embeds: List[discord.Embed] = []
         for card, orientation, meaning in spread_cards:
             embeds.append(self.build_card_embed(card, orientation, meaning, None, visual=True))
-        embeds.append(self.build_spread_summary_embed(spread_cards, intention, interpretation))
+        embeds.append(self.build_spread_summary_embed(spread_cards, focus, interpretation))
 
         await ctx.send(embeds=embeds)
         self.mark_daily(ctx.author.id, ctx.channel.id if ctx.channel else None)
-        await self.log_reading(ctx.author, intention, spread_cards, interpretation, spread=True)
+        await self.log_reading(ctx.author, focus, spread_cards, interpretation, spread=True)
 
 
 async def setup(bot: commands.Bot):
