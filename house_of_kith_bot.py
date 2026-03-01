@@ -541,6 +541,14 @@ async def omen(ctx, *, text: str = None):
     if not ctx.author.voice or not ctx.author.voice.channel:
         await ctx.send("You must stand in the dark with me first. Join a voice channel.")
         return
+    try:
+        import nacl  # noqa: F401  # required by discord voice
+    except Exception:
+        await ctx.send("`!omen` is unavailable: PyNaCl is missing. Install dependencies and restart the bot.")
+        return
+    if shutil.which("ffmpeg") is None:
+        await ctx.send("`!omen` is unavailable: FFmpeg is not installed or not on PATH.")
+        return
 
     voice_channel = ctx.author.voice.channel
     line = random.choice(CREEPY_LINES) if text is None else text
