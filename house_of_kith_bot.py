@@ -5,6 +5,7 @@ import asyncio
 import random
 import time
 import shutil
+import logging
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -43,6 +44,9 @@ BASE_DIR = Path(__file__).resolve().parent
 STATUS_MESSAGE_ID_FILE = BASE_DIR / "data" / "bot_status_message_id.txt"
 FOLLOWUP_WINDOW_SECONDS = 30.0
 ai_followup_windows: dict[tuple[int, int, int], float] = {}
+OMEN_ECHO_WINDOW_SECONDS = 45.0
+omen_echo_windows: dict[tuple[int, int], tuple[float, int]] = {}
+voice_last_error: dict[tuple[int, str], str] = {}
 
 CREEPY_LINES = [
     "Not every silence in this house is empty.",
@@ -54,6 +58,7 @@ CREEPY_LINES = [
     "The walls know more about you than any of us do.",
     "You are not the first soul this house has tried to keep.",
 ]
+_last_creepy_line: str | None = None
 
 SOCIAL_ROLES = [
     "DMs Open",
@@ -196,6 +201,7 @@ class HouseBot(commands.Bot):
 
 
 bot = HouseBot(command_prefix="!", intents=intents)
+logger = logging.getLogger("house_of_kith.voice")
 
 STATUS_ON = "\U0001F7E2"   # green circle
 STATUS_OFF = "\U0001F534"  # red circle
@@ -257,6 +263,40 @@ async def update_status_message(is_online: bool) -> None:
 
 def _followup_key(guild_id: int, channel_id: int, user_id: int) -> tuple[int, int, int]:
     return (guild_id, channel_id, user_id)
+
+
+def _omen_echo_key(guild_id: int, channel_id: int) -> tuple[int, int]:
+    return (guild_id, channel_id)
+
+
+def _open_omen_echo_window(guild_id: int, channel_id: int, voice_channel_id: int) -> None:
+    key = _omen_echo_key(guild_id, channel_id)
+    omen_echo_windows[key] = (time.monotonic() + OMEN_ECHO_WINDOW_SECONDS, voice_channel_id)
+
+
+def _has_omen_echo_window(guild_id: int, channel_id: int) -> bool:
+    key = _omen_echo_key(guild_id, channel_id)
+    entry = omen_echo_windows.get(key)
+    if entry is None:
+        return False
+    expires_at, _voice_channel_id = entry
+    if time.monotonic() > expires_at:
+        omen_echo_windows.pop(key, None)
+        return False
+    return True
+
+
+def _consume_omen_echo_window(guild_id: int, channel_id: int) -> int | None:
+    key = _omen_echo_key(guild_id, channel_id)
+    entry = omen_echo_windows.get(key)
+    if entry is None:
+        return None
+    expires_at, voice_channel_id = entry
+    if time.monotonic() > expires_at:
+        omen_echo_windows.pop(key, None)
+        return None
+    omen_echo_windows.pop(key, None)
+    return voice_channel_id
 
 
 def _open_followup_window(guild_id: int, channel_id: int, user_id: int) -> None:
@@ -533,6 +573,162 @@ async def generate_ai_voice_line(text: str, filename: str) -> Path:
     response.stream_to_file(str(output_path))
     return output_path
 
+
+def _pick_creepy_line() -> str:
+    global _last_creepy_line
+    if len(CREEPY_LINES) <= 1:
+        line = CREEPY_LINES[0]
+    else:
+        choices = [line for line in CREEPY_LINES if line != _last_creepy_line]
+        line = random.choice(choices if choices else CREEPY_LINES)
+    _last_creepy_line = line
+    return line
+
+
+def _voice_after_callback(channel: discord.abc.Messageable):
+    def _after(error: Exception | None) -> None:
+        if error is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                channel.send(f"Voice playback failed: `{error}`"),
+                bot.loop,
+            )
+        except Exception:
+            pass
+    return _after
+
+
+def _log_voice_event(event: str, guild_id: int, channel_id: int, detail: str = "") -> None:
+    msg = f"[voice:{event}] guild={guild_id} channel={channel_id}"
+    if detail:
+        msg = f"{msg} detail={detail}"
+    logger.warning(msg)
+
+
+def _set_voice_last_error(guild_id: int, context_label: str, detail: str) -> None:
+    voice_last_error[(guild_id, context_label)] = detail[:220]
+
+
+def _clear_voice_last_error(guild_id: int, context_label: str) -> None:
+    voice_last_error.pop((guild_id, context_label), None)
+
+
+def _get_voice_last_error(guild_id: int, context_label: str) -> str | None:
+    return voice_last_error.get((guild_id, context_label))
+
+
+def _voice_connect_help_text(detail: str | None) -> str:
+    if not detail:
+        return "I could not establish a stable voice connection."
+    if "4017" in detail:
+        return (
+            "I could not establish a stable voice connection. "
+            f"`{detail}`\n"
+            "Discord rejected the voice handshake (4017). "
+            "Try disabling VPN/proxy, allowing outbound UDP in firewall, and trying a different voice channel/region."
+        )
+    return f"I could not establish a stable voice connection. `{detail}`"
+
+
+def _voice_permission_error(guild: discord.Guild, channel: discord.abc.GuildChannel) -> str | None:
+    me = guild.me if guild.me else (guild.get_member(bot.user.id) if bot.user else None)
+    if me is None:
+        return "I cannot resolve my server member to verify voice permissions."
+    perms = channel.permissions_for(me)
+    if not perms.view_channel:
+        return "I cannot view that voice channel."
+    if not perms.connect:
+        return "I do not have Connect permission for that voice channel."
+    if isinstance(channel, discord.VoiceChannel) and not perms.speak:
+        return "I do not have Speak permission for that voice channel."
+    return None
+
+
+async def _ensure_voice_client(
+    guild: discord.Guild,
+    target_channel: discord.abc.GuildChannel,
+    *,
+    context_label: str,
+) -> discord.VoiceClient | None:
+    perm_error = _voice_permission_error(guild, target_channel)
+    if perm_error:
+        _set_voice_last_error(guild.id, context_label, perm_error)
+        _log_voice_event(
+            f"{context_label}_perm",
+            guild.id,
+            target_channel.id,
+            perm_error,
+        )
+        return None
+
+    max_attempts = 1
+    last_detail = "unknown connect failure"
+
+    for attempt in range(1, max_attempts + 1):
+        vc = guild.voice_client
+        try:
+            if vc and vc.is_connected():
+                if vc.channel and vc.channel.id != target_channel.id:
+                    await vc.move_to(target_channel, timeout=10.0)
+            elif vc:
+                # Drop stale/disconnected clients before a fresh connect.
+                try:
+                    await vc.disconnect(force=True)
+                except Exception:
+                    pass
+                await asyncio.sleep(0.75)
+                vc = await target_channel.connect(reconnect=False, timeout=12.0)
+            else:
+                vc = await target_channel.connect(reconnect=False, timeout=12.0)
+
+            if vc is not None and vc.is_connected():
+                _clear_voice_last_error(guild.id, context_label)
+                return vc
+
+            raise discord.ClientException("voice client disconnected after connect/move")
+        except Exception as e:
+            last_detail = f"{type(e).__name__}: {e}"
+            _set_voice_last_error(guild.id, context_label, last_detail)
+            _log_voice_event(
+                f"{context_label}_connect_fail_attempt_{attempt}",
+                guild.id,
+                target_channel.id,
+                last_detail,
+            )
+
+            is_transient = (
+                "4017" in last_detail
+                or "Timed out connecting to voice" in last_detail
+                or isinstance(e, asyncio.TimeoutError)
+            )
+            if attempt < max_attempts and is_transient:
+                stale = guild.voice_client
+                if stale:
+                    try:
+                        await stale.disconnect(force=True)
+                    except Exception:
+                        pass
+                await asyncio.sleep(1.25)
+                _log_voice_event(
+                    f"{context_label}_connect_retry",
+                    guild.id,
+                    target_channel.id,
+                    f"retrying after transient failure: {last_detail}",
+                )
+                continue
+            break
+
+    _set_voice_last_error(guild.id, context_label, last_detail)
+    _log_voice_event(
+        f"{context_label}_not_connected",
+        guild.id,
+        target_channel.id,
+        last_detail,
+    )
+    return None
+
+
 # =========================
 # COMMAND: !omen
 # =========================
@@ -551,7 +747,8 @@ async def omen(ctx, *, text: str = None):
         return
 
     voice_channel = ctx.author.voice.channel
-    line = random.choice(CREEPY_LINES) if text is None else text
+    custom_text = (text or "").strip()
+    line = custom_text if custom_text else _pick_creepy_line()
 
     await ctx.send("\U0001F56F Giving voice to your words...")
 
@@ -561,24 +758,61 @@ async def omen(ctx, *, text: str = None):
         await ctx.send(f"Voice generation failed: `{e}`")
         return
 
-    vc: discord.VoiceClient = ctx.voice_client
-    if vc and vc.channel != voice_channel:
-        await vc.move_to(voice_channel)
-    elif not vc:
-        vc = await voice_channel.connect()
+    if ctx.guild is None:
+        await ctx.send("`!omen` only works in a server.")
+        return
+
+    vc = await _ensure_voice_client(ctx.guild, voice_channel, context_label="omen_initial")
+    if vc is None:
+        perm_error = _voice_permission_error(ctx.guild, voice_channel)
+        detail = _get_voice_last_error(ctx.guild.id, "omen_initial")
+        await ctx.send(perm_error or _voice_connect_help_text(detail))
+        return
+
+    if not vc.is_connected():
+        _log_voice_event("omen_initial_dropped", ctx.guild.id, voice_channel.id, "disconnected pre-play")
+        await ctx.send("I connected, but the voice session dropped before playback.")
+        return
 
     if vc.is_playing():
         vc.stop()
 
     source = discord.FFmpegPCMAudio(str(audio_path))
-    vc.play(source)
+    try:
+        vc.play(source, after=_voice_after_callback(ctx.channel))
+    except discord.ClientException as e:
+        _log_voice_event("omen_initial_play_client_exception", ctx.guild.id, voice_channel.id, repr(e))
+        await ctx.send(f"Voice playback failed: `{e}`")
+        return
+    except Exception as e:
+        _log_voice_event("omen_initial_play_exception", ctx.guild.id, voice_channel.id, repr(e))
+        await ctx.send(f"Voice playback failed: `{e}`")
+        return
 
     await ctx.send(f"\U0001F4D6 *The House whispers:* `{line}`")
+    await asyncio.sleep(0.25)
+    if not vc.is_playing():
+        _log_voice_event("omen_initial_not_playing", ctx.guild.id, voice_channel.id, "play did not start")
+        await ctx.send("I connected, but the voice session dropped before playback.")
+        return
 
     while vc.is_playing():
         await asyncio.sleep(0.5)
 
-    await vc.disconnect()
+    guild_id = ctx.guild.id if ctx.guild else 0
+    _open_omen_echo_window(guild_id, ctx.channel.id, voice_channel.id)
+    await ctx.send(
+        f"Type one message in this channel within {int(OMEN_ECHO_WINDOW_SECONDS)}s, and I will repeat it in the dark."
+    )
+
+    deadline = time.monotonic() + OMEN_ECHO_WINDOW_SECONDS
+    while time.monotonic() <= deadline and _has_omen_echo_window(guild_id, ctx.channel.id):
+        await asyncio.sleep(0.5)
+
+    if _consume_omen_echo_window(guild_id, ctx.channel.id) is not None:
+        if vc and vc.is_connected() and not vc.is_playing():
+            await vc.disconnect()
+        await ctx.send("The whisper window closed.")
 
 # =========================
 # ARCHIVE REACTION HANDLER
@@ -636,10 +870,70 @@ async def on_message(message: discord.Message):
         return
 
     guild_id = message.guild.id if message.guild else 0
+    spoken_text = message.content.strip()
+    if spoken_text:
+        omen_voice_channel_id = _consume_omen_echo_window(guild_id, message.channel.id)
+        if omen_voice_channel_id is not None:
+            guild = message.guild
+            if guild is None:
+                return
+            voice_channel = guild.get_channel(omen_voice_channel_id)
+            if not isinstance(voice_channel, (discord.VoiceChannel, discord.StageChannel)):
+                _log_voice_event("omen_echo_missing_channel", guild.id, omen_voice_channel_id, "channel not found")
+                await message.channel.send("The voice faded before I could speak it.")
+                return
+
+            await message.channel.send("\U0001F56F Repeating your words...")
+            try:
+                audio_path = await generate_ai_voice_line(
+                    spoken_text,
+                    filename=f"omen_echo_{message.author.id}.wav",
+                )
+            except Exception as e:
+                await message.channel.send(f"Voice generation failed: `{e}`")
+                return
+
+            vc = await _ensure_voice_client(guild, voice_channel, context_label="omen_echo")
+            if vc is None:
+                perm_error = _voice_permission_error(guild, voice_channel)
+                detail = _get_voice_last_error(guild.id, "omen_echo")
+                await message.channel.send(perm_error or _voice_connect_help_text(detail))
+                return
+
+            if not vc.is_connected():
+                _log_voice_event("omen_echo_dropped", guild.id, voice_channel.id, "disconnected pre-play")
+                await message.channel.send("I connected, but the voice session dropped before playback.")
+                return
+
+            if vc.is_playing():
+                vc.stop()
+            try:
+                vc.play(discord.FFmpegPCMAudio(str(audio_path)), after=_voice_after_callback(message.channel))
+            except discord.ClientException as e:
+                _log_voice_event("omen_echo_play_client_exception", guild.id, voice_channel.id, repr(e))
+                await message.channel.send(f"Voice playback failed: `{e}`")
+                return
+            except Exception as e:
+                _log_voice_event("omen_echo_play_exception", guild.id, voice_channel.id, repr(e))
+                await message.channel.send(f"Voice playback failed: `{e}`")
+                return
+
+            await message.channel.send(f"\U0001F4D6 *The House repeats:* `{spoken_text}`")
+            await asyncio.sleep(0.25)
+            if not vc.is_playing():
+                _log_voice_event("omen_echo_not_playing", guild.id, voice_channel.id, "play did not start")
+                await message.channel.send("I connected, but the voice session dropped before playback.")
+                return
+
+            while vc.is_playing():
+                await asyncio.sleep(0.5)
+            await vc.disconnect()
+            return
+
     if not _has_followup_window(guild_id, message.channel.id, message.author.id):
         return
 
-    question = message.content.strip()
+    question = spoken_text
     if not question:
         return
 

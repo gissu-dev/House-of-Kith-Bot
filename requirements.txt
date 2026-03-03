@@ -8,6 +8,7 @@ audioop-lts==0.2.2
 certifi==2026.2.25
 colorama==0.4.6
 discord.py==2.7.0
+davey==0.1.4
 distro==1.9.0
 frozenlist==1.8.0
 h11==0.16.0
