@@ -3,3 +3,11 @@ venv/
 __pycache__/
 *.pyc
 .env
+
+# Runtime/cache artifacts
+sounds/ai_voice/*.wav
+data/valorant.db
+data/stats.json
+data/tarot_daily.json
+data/bot_status_message_id.txt
+*.log
